@@ -32,24 +32,16 @@ Code differences compared to source project demokratos.
  }
 ```
 
-## cmd/demo2kratos/wire_gen.go (+5 -1)
+## cmd/demo2kratos/wire_gen.go (+4 -1)
 
 ```diff
-@@ -2,6 +2,7 @@
- 
- //go:generate go run -mod=mod github.com/google/wire/cmd/wire
- //go:build !wireinject
-+// +build !wireinject
- 
- package main
- 
-@@ -28,7 +29,10 @@
+@@ -28,7 +28,10 @@
  	greeterService := service.NewGreeterService(greeterUsecase)
  	grpcServer := server.NewGRPCServer(confServer, greeterService, logger)
  	httpServer := server.NewHTTPServer(confServer, greeterService, logger)
 -	app := newApp(logger, grpcServer, httpServer)
 +	taskUsecase := biz.NewTaskUsecase(logger)
-+	cronService := service.NewCronService(taskUsecase)
++	cronService := service.NewCronService(taskUsecase, logger)
 +	cronkratosServer := server.NewCronServer(cronService, logger)
 +	app := newApp(logger, grpcServer, httpServer, cronkratosServer)
  	return app, func() {
@@ -68,55 +60,86 @@ Code differences compared to source project demokratos.
 +var ProviderSet = wire.NewSet(NewGreeterUsecase, NewTaskUsecase)
 ```
 
-## internal/biz/task.go (+36 -0)
+## internal/biz/task.go (+65 -0)
 
 ```diff
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,65 @@
 +package biz
 +
 +import (
 +	"context"
++	"sync"
 +	"time"
 +
++	"github.com/go-kratos/kratos/v2/errors"
 +	"github.com/go-kratos/kratos/v2/log"
++	v1 "github.com/orzkratos/demokratos/demo2kratos/api/helloworld/v1"
 +)
 +
 +// TaskUsecase handles scheduled task business logic
 +// 处理定时任务的业务逻辑
 +type TaskUsecase struct {
-+	log *log.Helper
++	slog *log.Helper
 +}
 +
 +// NewTaskUsecase creates a new TaskUsecase instance
 +// 创建新的 TaskUsecase 实例
 +func NewTaskUsecase(logger log.Logger) *TaskUsecase {
 +	return &TaskUsecase{
-+		log: log.NewHelper(logger),
++		slog: log.NewHelper(logger),
 +	}
 +}
 +
-+// SyncData performs data synchronization task
-+// 执行数据同步任务
-+func (uc *TaskUsecase) SyncData(ctx context.Context) error {
-+	uc.log.WithContext(ctx).Infof("SyncData task executed at %s", time.Now().Format(time.RFC3339))
++// SyncData performs data sync in loop, lock each iteration
++// 循环同步数据，每次迭代加锁
++func (uc *TaskUsecase) SyncData(ctx context.Context, locker sync.Locker) *errors.Error {
++	for i := 0; i < 10; i++ {
++		if erk := uc.syncOnce(ctx, locker); erk != nil {
++			return erk
++		}
++	}
++	uc.slog.Info("SyncData complete")
 +	return nil
 +}
 +
-+// CleanupData performs data cleanup task
-+// 执行数据清理任务
-+func (uc *TaskUsecase) CleanupData(ctx context.Context) error {
-+	uc.log.WithContext(ctx).Infof("CleanupData task executed at %s", time.Now().Format(time.RFC3339))
++// syncOnce performs single data sync with lock protection
++// 执行单次数据同步，带锁保护
++func (uc *TaskUsecase) syncOnce(ctx context.Context, locker sync.Locker) *errors.Error {
++	locker.Lock()
++	defer locker.Unlock()
++	// Check ctx validity after acquiring lock, exit if cancelled
++	// 获取锁后检查 ctx 是否有效，已取消则退出
++	if ctx.Err() != nil {
++		return v1.ErrorUnknown("context error=%v", ctx.Err())
++	}
++	uc.slog.WithContext(ctx).Infof("syncOnce executed at %s", time.Now().Format(time.RFC3339))
++	return nil
++}
++
++// CleanupData performs data cleanup with lock at biz layer
++// 在业务层加锁执行数据清理
++func (uc *TaskUsecase) CleanupData(ctx context.Context, locker sync.Locker) *errors.Error {
++	locker.Lock()
++	defer locker.Unlock()
++	// Check ctx validity after acquiring lock, exit if cancelled
++	// 获取锁后检查 ctx 是否有效，已取消则退出
++	if ctx.Err() != nil {
++		return v1.ErrorUnknown("context error=%v", ctx.Err())
++	}
++	uc.slog.WithContext(ctx).Infof("CleanupData executed at %s", time.Now().Format(time.RFC3339))
 +	return nil
 +}
 ```
 
-## internal/server/cron.go (+16 -0)
+## internal/server/cron.go (+24 -0)
 
 ```diff
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,24 @@
 +package server
 +
 +import (
++	"time"
++
 +	"github.com/go-kratos/kratos/v2/log"
 +	"github.com/orzkratos/cronkratos"
 +	"github.com/orzkratos/demokratos/demo2kratos/internal/service"
@@ -125,9 +148,15 @@ Code differences compared to source project demokratos.
 +
 +// NewCronServer creates a new cron server and registers cron jobs with locker
 +// 创建新的 cron server 并注册带锁的定时任务
-+func NewCronServer(cronSvc *service.CronService, logger log.Logger) *cronkratos.Server {
-+	srv := cronkratos.NewServer(cron.New(), logger)
-+	cronkratos.RegisterCronServerL(srv, cronSvc)
++func NewCronServer(cronService *service.CronService, logger log.Logger) *cronkratos.Server {
++	srv := cronkratos.NewServer(
++		cron.New(
++			cron.WithSeconds(),
++			cron.WithLocation(time.FixedZone("CST", 8*60*60)), // UTC+8
++		),
++		logger,
++	)
++	cronkratos.RegisterCronServerL(srv, cronService)
 +	return srv
 +}
 ```
@@ -143,50 +172,57 @@ Code differences compared to source project demokratos.
 +var ProviderSet = wire.NewSet(NewGRPCServer, NewHTTPServer, NewCronServer)
 ```
 
-## internal/service/cron.go (+41 -0)
+## internal/service/cron.go (+48 -0)
 
 ```diff
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,48 @@
 +package service
 +
 +import (
 +	"context"
 +	"sync"
 +
++	"github.com/go-kratos/kratos/v2/log"
 +	"github.com/orzkratos/demokratos/demo2kratos/internal/biz"
 +	"github.com/robfig/cron/v3"
++	"github.com/yyle88/rese"
 +)
 +
 +// CronService handles cron job registration with locker
 +// 处理带锁的定时任务注册
 +type CronService struct {
 +	task *biz.TaskUsecase
++	slog *log.Helper
 +}
 +
 +// NewCronService creates a new CronService instance
 +// 创建新的 CronService 实例
-+func NewCronService(task *biz.TaskUsecase) *CronService {
-+	return &CronService{task: task}
++func NewCronService(task *biz.TaskUsecase, logger log.Logger) *CronService {
++	return &CronService{task: task, slog: log.NewHelper(logger)}
 +}
 +
-+// RegisterCron registers cron jobs with locker for graceful shutdown
-+// 注册定时任务，使用锁支持优雅退出
++// RegisterCron registers cron jobs with locker for safe shutdown
++// 注册定时任务，使用锁支持安全退出
 +func (s *CronService) RegisterCron(ctx context.Context, c *cron.Cron, locker sync.Locker) {
-+	// Sync data every minute with lock protection
-+	// 每分钟同步数据，带锁保护
-+	_, _ = c.AddFunc("* * * * *", func() {
-+		locker.Lock()
-+		defer locker.Unlock()
-+		_ = s.task.SyncData(ctx)
-+	})
++	// Sync data every minute, lock each iteration in biz loop
++	// 每分钟同步数据，在业务层循环中每次迭代加锁
++	rese.C1(c.AddFunc("0 * * * * *", func() {
++		if erk := s.task.SyncData(ctx, locker); erk != nil {
++			s.slog.Errorf("sync data task error: %v", erk)
++		} else {
++			s.slog.Info("sync data task success")
++		}
++	}))
 +
-+	// Cleanup data every hour with lock protection
-+	// 每小时清理数据，带锁保护
-+	_, _ = c.AddFunc("0 * * * *", func() {
-+		locker.Lock()
-+		defer locker.Unlock()
-+		_ = s.task.CleanupData(ctx)
-+	})
++	// Cleanup data every second, lock at biz layer
++	// 每秒清理数据，在业务层加锁
++	rese.C1(c.AddFunc("* * * * * *", func() {
++		if erk := s.task.CleanupData(ctx, locker); erk != nil {
++			s.slog.Errorf("cleanup data task error: %v", erk)
++		} else {
++			s.slog.Info("cleanup data task success")
++		}
++	}))
 +}
 ```
 

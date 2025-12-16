@@ -32,24 +32,16 @@ Code differences compared to source project demokratos.
  }
 ```
 
-## cmd/demo1kratos/wire_gen.go (+5 -1)
+## cmd/demo1kratos/wire_gen.go (+4 -1)
 
 ```diff
-@@ -2,6 +2,7 @@
- 
- //go:generate go run -mod=mod github.com/google/wire/cmd/wire
- //go:build !wireinject
-+// +build !wireinject
- 
- package main
- 
-@@ -28,7 +29,10 @@
+@@ -28,7 +28,10 @@
  	greeterService := service.NewGreeterService(greeterUsecase)
  	grpcServer := server.NewGRPCServer(confServer, greeterService, logger)
  	httpServer := server.NewHTTPServer(confServer, greeterService, logger)
 -	app := newApp(logger, grpcServer, httpServer)
 +	taskUsecase := biz.NewTaskUsecase(logger)
-+	cronService := service.NewCronService(taskUsecase)
++	cronService := service.NewCronService(taskUsecase, logger)
 +	cronkratosServer := server.NewCronServer(cronService, logger)
 +	app := newApp(logger, grpcServer, httpServer, cronkratosServer)
  	return app, func() {
@@ -68,59 +60,77 @@ Code differences compared to source project demokratos.
 +var ProviderSet = wire.NewSet(NewGreeterUsecase, NewTaskUsecase)
 ```
 
-## internal/biz/task.go (+40 -0)
+## internal/biz/task.go (+56 -0)
 
 ```diff
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,56 @@
 +package biz
 +
 +import (
 +	"context"
 +	"time"
 +
++	"github.com/go-kratos/kratos/v2/errors"
 +	"github.com/go-kratos/kratos/v2/log"
++	v1 "github.com/orzkratos/demokratos/demo1kratos/api/helloworld/v1"
 +)
 +
 +// TaskUsecase handles scheduled task business logic
 +// 处理定时任务的业务逻辑
 +type TaskUsecase struct {
-+	log *log.Helper
++	slog *log.Helper
 +}
 +
 +// NewTaskUsecase creates a new TaskUsecase instance
 +// 创建新的 TaskUsecase 实例
 +func NewTaskUsecase(logger log.Logger) *TaskUsecase {
 +	return &TaskUsecase{
-+		log: log.NewHelper(logger),
++		slog: log.NewHelper(logger),
 +	}
 +}
 +
-+// SyncData performs data synchronization task
-+// 执行数据同步任务
-+func (uc *TaskUsecase) SyncData(ctx context.Context) error {
-+	uc.log.WithContext(ctx).Infof("SyncData task executed at %s", time.Now().Format(time.RFC3339))
-+	// TODO: Add actual sync logic here
-+	// TODO: 在这里添加实际的同步逻辑
++// SyncData performs data sync in loop
++// 循环同步数据
++func (uc *TaskUsecase) SyncData(ctx context.Context) *errors.Error {
++	for i := 0; i < 10; i++ {
++		if erk := uc.syncOnce(ctx); erk != nil {
++			return erk
++		}
++	}
++	uc.slog.Info("SyncData complete")
++	return nil
++}
++
++// syncOnce performs single data sync
++// 执行单次数据同步
++func (uc *TaskUsecase) syncOnce(ctx context.Context) *errors.Error {
++	if ctx.Err() != nil {
++		return v1.ErrorUnknown("context error=%v", ctx.Err())
++	}
++	uc.slog.WithContext(ctx).Infof("syncOnce executed at %s", time.Now().Format(time.RFC3339))
 +	return nil
 +}
 +
 +// CleanupData performs data cleanup task
 +// 执行数据清理任务
-+func (uc *TaskUsecase) CleanupData(ctx context.Context) error {
-+	uc.log.WithContext(ctx).Infof("CleanupData task executed at %s", time.Now().Format(time.RFC3339))
-+	// TODO: Add actual cleanup logic here
-+	// TODO: 在这里添加实际的清理逻辑
++func (uc *TaskUsecase) CleanupData(ctx context.Context) *errors.Error {
++	if ctx.Err() != nil {
++		return v1.ErrorUnknown("context error=%v", ctx.Err())
++	}
++	uc.slog.WithContext(ctx).Infof("CleanupData executed at %s", time.Now().Format(time.RFC3339))
 +	return nil
 +}
 ```
 
-## internal/server/cron.go (+16 -0)
+## internal/server/cron.go (+24 -0)
 
 ```diff
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,24 @@
 +package server
 +
 +import (
++	"time"
++
 +	"github.com/go-kratos/kratos/v2/log"
 +	"github.com/orzkratos/cronkratos"
 +	"github.com/orzkratos/demokratos/demo1kratos/internal/service"
@@ -129,9 +139,15 @@ Code differences compared to source project demokratos.
 +
 +// NewCronServer creates a new cron server and registers cron jobs
 +// 创建新的 cron server 并注册定时任务
-+func NewCronServer(cronSvc *service.CronService, logger log.Logger) *cronkratos.Server {
-+	srv := cronkratos.NewServer(cron.New(), logger)
-+	cronkratos.RegisterCronServer(srv, cronSvc)
++func NewCronServer(cronService *service.CronService, logger log.Logger) *cronkratos.Server {
++	srv := cronkratos.NewServer(
++		cron.New(
++			cron.WithSeconds(),
++			cron.WithLocation(time.FixedZone("CST", 8*60*60)), // UTC+8
++		),
++		logger,
++	)
++	cronkratos.RegisterCronServer(srv, cronService)
 +	return srv
 +}
 ```
@@ -147,29 +163,32 @@ Code differences compared to source project demokratos.
 +var ProviderSet = wire.NewSet(NewGRPCServer, NewHTTPServer, NewCronServer)
 ```
 
-## internal/service/cron.go (+36 -0)
+## internal/service/cron.go (+47 -0)
 
 ```diff
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,47 @@
 +package service
 +
 +import (
 +	"context"
 +
++	"github.com/go-kratos/kratos/v2/log"
 +	"github.com/orzkratos/demokratos/demo1kratos/internal/biz"
 +	"github.com/robfig/cron/v3"
++	"github.com/yyle88/rese"
 +)
 +
 +// CronService handles cron job registration
 +// 处理定时任务注册
 +type CronService struct {
 +	task *biz.TaskUsecase
++	slog *log.Helper
 +}
 +
 +// NewCronService creates a new CronService instance
 +// 创建新的 CronService 实例
-+func NewCronService(task *biz.TaskUsecase) *CronService {
-+	return &CronService{task: task}
++func NewCronService(task *biz.TaskUsecase, logger log.Logger) *CronService {
++	return &CronService{task: task, slog: log.NewHelper(logger)}
 +}
 +
 +// RegisterCron registers cron jobs to cron instance
@@ -177,15 +196,23 @@ Code differences compared to source project demokratos.
 +func (s *CronService) RegisterCron(ctx context.Context, c *cron.Cron) {
 +	// Sync data every minute
 +	// 每分钟同步数据
-+	_, _ = c.AddFunc("* * * * *", func() {
-+		_ = s.task.SyncData(ctx)
-+	})
++	rese.C1(c.AddFunc("0 * * * * *", func() {
++		if erk := s.task.SyncData(ctx); erk != nil {
++			s.slog.Errorf("sync data task error: %v", erk)
++		} else {
++			s.slog.Info("sync data task success")
++		}
++	}))
 +
-+	// Cleanup data every hour
-+	// 每小时清理数据
-+	_, _ = c.AddFunc("0 * * * *", func() {
-+		_ = s.task.CleanupData(ctx)
-+	})
++	// Cleanup data every second
++	// 每秒清理数据
++	rese.C1(c.AddFunc("* * * * * *", func() {
++		if erk := s.task.CleanupData(ctx); erk != nil {
++			s.slog.Errorf("cleanup data task error: %v", erk)
++		} else {
++			s.slog.Info("cleanup data task success")
++		}
++	}))
 +}
 ```
 
